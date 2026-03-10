@@ -1,0 +1,252 @@
+# 08. パフォーマンス考慮：遅いクエリを生まない設計
+
+---
+
+## 1. パフォーマンス問題はテーブル設計に起因することが多い
+
+アプリが遅いとき、多くの場合は：
+1. インデックスが不適切 → `05_index_design.md` で対処
+2. テーブル設計自体が問題 → このファイルで対処
+3. クエリの書き方が悪い → クエリレベルの最適化
+
+設計の時点でパフォーマンスを意識しておくと後のチューニングが楽になる。
+
+---
+
+## 2. N+1問題とJOIN設計
+
+### N+1問題とは
+
+```
+1回のクエリ + N件分の繰り返しクエリ = N+1回のクエリ
+
+例：
+1. ユーザー100件を取得（1クエリ）
+2. 各ユーザーの注文数をそれぞれ取得（100クエリ）
+→ 合計101クエリ（非常に遅い）
+```
+
+### N+1が起きる設計例
+
+```sql
+-- まずユーザーを全件取得
+SELECT * FROM users;  -- 100件返る
+
+-- その後、ループで各ユーザーの注文数を取得（アプリ側）
+-- for each user:
+SELECT COUNT(*) FROM orders WHERE user_id = {user.id};
+-- → 100回実行される
+```
+
+### 解決策：JOINまたはサブクエリで1回で取得
+
+```sql
+-- JOINで解決
+SELECT
+  users.id,
+  users.name,
+  COUNT(orders.id) AS order_count
+FROM users
+LEFT JOIN orders ON users.id = orders.user_id
+GROUP BY users.id, users.name;
+
+-- または WHERE IN で一括取得
+SELECT user_id, COUNT(*) AS order_count
+FROM orders
+WHERE user_id IN (1, 2, 3, ..., 100)  -- アプリ側でIDリストを渡す
+GROUP BY user_id;
+```
+
+---
+
+## 3. JOINのパフォーマンス
+
+### JOINが遅くなるケース
+
+```sql
+-- ❌ JOINするカラムにインデックスがない
+SELECT * FROM orders
+JOIN users ON orders.user_id = users.id  -- user_id にインデックスがないと遅い
+
+-- ✅ FKカラムには必ずインデックスを貼る
+INDEX idx_orders_user_id (user_id)
+```
+
+### SELECT * は避ける
+
+```sql
+-- ❌ 不要なカラムもすべて取得
+SELECT * FROM orders JOIN users ON orders.user_id = users.id;
+
+-- ✅ 必要なカラムだけ取得（転送量削減・カバリングインデックス活用）
+SELECT orders.id, orders.total_amount, users.name
+FROM orders JOIN users ON orders.user_id = users.id;
+```
+
+### JOINするテーブル数に注意
+
+```
+JOINは増えるほど複雑度が増す。
+目安：1クエリで4〜5テーブル以上のJOINはパフォーマンスに注意。
+→ 設計を見直す or アプリ側で分割する or 非正規化を検討する。
+```
+
+---
+
+## 4. ページネーション設計
+
+### OFFSETによるページネーション（大量データで遅い）
+
+```sql
+-- ❌ データが多いと遅い（100万件目のページを取得する場合、99万件スキャンが必要）
+SELECT * FROM articles
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 1000000;
+```
+
+### カーソルベースのページネーション（推奨）
+
+```sql
+-- ✅ 前回の最後のIDを使って次のページを取得（常に高速）
+SELECT * FROM articles
+WHERE id < {last_id}  -- 前のページの最後のIDより小さいものを取得
+ORDER BY id DESC
+LIMIT 20;
+```
+
+| 比較 | OFFSET方式 | カーソル方式 |
+|------|----------|------------|
+| 実装 | シンプル | やや複雑 |
+| パフォーマンス | データ量が増えると遅くなる | 常に安定して速い |
+| ページ指定 | 任意のページに直接アクセス可能 | 前後のページ移動のみ |
+| 用途 | 少量データ・管理画面 | SNSフィード・大量データ |
+
+---
+
+## 5. 集計処理のパフォーマンス
+
+### 毎回集計するのが重い場合：集計テーブルのキャッシュ
+
+```sql
+-- ❌ リクエストのたびに全注文を集計する
+SELECT COUNT(*) FROM orders WHERE user_id = 100;
+
+-- ✅ usersテーブルにキャッシュカラムを持つ（非正規化）
+ALTER TABLE users ADD COLUMN order_count INT UNSIGNED NOT NULL DEFAULT 0;
+
+-- 注文が追加・削除されたときにアプリ側で更新する
+UPDATE users SET order_count = order_count + 1 WHERE id = 100;
+```
+
+**注意：** キャッシュカラムは整合性を保つ責任がアプリ側に生じる。不整合リスクを考慮して使う。
+
+### 日次バッチで集計する方法
+
+```sql
+-- 集計結果を別テーブルに保存する
+CREATE TABLE daily_sales_summaries (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  date       DATE NOT NULL,
+  total_amount DECIMAL(15,2) NOT NULL,
+  order_count  INT UNSIGNED NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_date (date)
+);
+
+-- 毎晩バッチで当日分を集計・保存
+INSERT INTO daily_sales_summaries (date, total_amount, order_count)
+SELECT
+  DATE(ordered_at),
+  SUM(total_amount),
+  COUNT(*)
+FROM orders
+WHERE DATE(ordered_at) = CURDATE()
+ON DUPLICATE KEY UPDATE
+  total_amount = VALUES(total_amount),
+  order_count  = VALUES(order_count);
+```
+
+---
+
+## 6. データ量を見越した設計
+
+### パーティショニング（大量データ対応）
+
+ログや時系列データで数千万〜数億件になる場合に検討する。
+
+```sql
+-- 月別パーティション（DATE型カラムが必要）
+CREATE TABLE access_logs (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id    INT UNSIGNED,
+  accessed_at DATETIME NOT NULL,
+  path       VARCHAR(500) NOT NULL,
+  PRIMARY KEY (id, accessed_at)  -- パーティションキーをPKに含める必要がある
+)
+PARTITION BY RANGE (YEAR(accessed_at) * 100 + MONTH(accessed_at)) (
+  PARTITION p202401 VALUES LESS THAN (202402),
+  PARTITION p202402 VALUES LESS THAN (202403),
+  ...
+);
+```
+
+**パーティショニングが効くケース：**
+- WHERE句にパーティションキーを含むクエリが大半を占める場合
+- 古いパーティションを DROP で一括削除したい場合
+
+### アーカイブテーブル
+
+古いデータをアーカイブテーブルに移すことでメインテーブルを小さく保つ。
+
+```sql
+-- メインテーブル（最新1年分）
+orders
+
+-- アーカイブテーブル（1年以上前）
+orders_archive  -- 同じ構造
+```
+
+---
+
+## 7. 読み取り専用レプリカの活用
+
+高トラフィックシステムでは「書き込み用DB（プライマリ）」と「読み取り用DB（レプリカ）」を分ける。
+
+```
+Primary DB (書き込み)
+    ↓ レプリケーション
+Replica DB (読み取り専用)
+```
+
+**テーブル設計での考慮点：**
+- レプリカ遅延（数ms〜数秒）があるため、書き込み直後の読み取りはプライマリから行う
+- 整合性が重要な操作（在庫チェックなど）は必ずプライマリを参照する
+
+---
+
+## 8. 設計段階でのパフォーマンスチェックリスト
+
+```
+□ JOINするカラム（FK）にインデックスを貼っているか
+□ WHERE句でよく使うカラムにインデックスがあるか
+□ SELECT * を使わず必要なカラムだけ取得しているか
+□ N+1問題が起きそうな設計になっていないか
+□ 大量データになる可能性があるテーブルを識別できているか
+□ 集計が重くなりそうな処理に対してキャッシュ戦略があるか
+□ ページネーションはカーソル方式を検討しているか（大量データの場合）
+□ ログ・履歴テーブルのデータ増加に対応できる設計か
+```
+
+---
+
+## 9. まとめ
+
+- N+1問題はJOINやIN句を使った一括取得で解決する
+- FKカラムには常にインデックスを貼り、JOINが遅くならないようにする
+- 大量データには OFFSET ページネーションではなくカーソルベースを使う
+- 重い集計はキャッシュカラムや集計テーブルで対処する
+- パフォーマンス問題は「計測してから対処する」順序が重要
+
+---
+
+**次のステップ：[09_anti_patterns.md](./09_anti_patterns.md)** → やってはいけない設計とその理由
