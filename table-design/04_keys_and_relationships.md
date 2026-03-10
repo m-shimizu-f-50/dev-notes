@@ -1,0 +1,272 @@
+# 04. キーとリレーションシップ：テーブル間のつながり
+
+---
+
+## 1. 主キー（Primary Key）の設計
+
+### 主キーの役割
+
+- テーブル内の行を**一意に識別**するカラム（または複数カラムの組み合わせ）
+- NULL不可・重複不可
+- **すべてのテーブルに必ず設定する**
+
+### サロゲートキー vs ナチュラルキー
+
+**サロゲートキー（代理キー）：** システムが自動採番した意味のない番号
+
+```sql
+-- サロゲートキーの例
+id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY
+```
+
+**ナチュラルキー（自然キー）：** ビジネス上の意味を持つ値
+
+```sql
+-- ナチュラルキーの例
+email VARCHAR(255) NOT NULL PRIMARY KEY
+-- または
+product_code CHAR(8) NOT NULL PRIMARY KEY
+```
+
+### 実務での推奨：サロゲートキー（AUTO INCREMENT の `id`）
+
+| 比較項目 | サロゲートキー | ナチュラルキー |
+|---------|---------------|---------------|
+| 変更リスク | 変わらない（安全） | ビジネスルール変更で破綻しうる |
+| JOIN効率 | INT比較で速い | 文字列比較で遅くなりやすい |
+| 外部参照 | 安定 | 参照先が変わると全FK更新が必要 |
+| 可読性 | 意味がわからない | 意味がわかる |
+
+→ **基本はサロゲートキー。ナチュラルキーは別途 UNIQUE 制約で管理する。**
+
+### UUID vs AUTO INCREMENT
+
+```sql
+-- AUTO INCREMENT（推奨：シンプル・高速）
+id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY
+
+-- UUID（分散環境・セキュリティが必要な場合）
+id CHAR(36) NOT NULL DEFAULT (UUID()) PRIMARY KEY
+```
+
+| 比較項目 | AUTO INCREMENT | UUID |
+|---------|----------------|------|
+| 重複リスク | 単一DBなら安全 | 事実上ゼロ |
+| 順序 | 常に連番・時系列 | v4はランダム |
+| パフォーマンス | インデックス挿入が速い | ランダムで挿入が遅くなりやすい |
+| セキュリティ | ID推測がしやすい | 推測困難 |
+| 用途 | 一般的な用途 | 分散DB・公開API・外部公開ID |
+
+---
+
+## 2. 外部キー（Foreign Key）
+
+### 基本構文
+
+```sql
+CREATE TABLE orders (
+  id      INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT UNSIGNED NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+### 参照整合性とは
+
+外部キー制約があると「存在しない `user_id` を入れようとしたらエラーになる」ことが保証される。
+
+```sql
+-- user_id=999 が users テーブルに存在しない場合 → エラー
+INSERT INTO orders (user_id) VALUES (999);
+-- Error: Cannot add or update a child row: a foreign key constraint fails
+```
+
+### ON DELETE / ON UPDATE の設定
+
+親テーブル（参照先）の行を削除・更新したとき、子テーブル（参照元）をどう扱うかを指定する。
+
+```sql
+FOREIGN KEY (user_id) REFERENCES users(id)
+  ON DELETE CASCADE    -- 親削除時：子も一緒に削除
+  ON UPDATE CASCADE    -- 親更新時：子のFKも自動更新
+```
+
+| オプション | DELETE時の動作 | 使いどころ |
+|-----------|--------------|-----------|
+| `CASCADE` | 子レコードも削除 | 注文明細（注文が消えたら明細も不要） |
+| `RESTRICT` / `NO ACTION` | 子が存在する場合に削除エラー（デフォルト） | 重要なデータを誤って消さないように |
+| `SET NULL` | 子のFKをNULLにする | 担当者が削除されても案件は残したい場合 |
+| `SET DEFAULT` | 子のFKをデフォルト値にする | あまり使わない |
+
+**実務での使い分け：**
+```sql
+-- orders を削除したら order_items も消す
+FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+
+-- users を削除しても orders は残す（問い合わせ履歴を保持したい）
+FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
+```
+
+---
+
+## 3. リレーションシップの種類
+
+### 1対1（One to One）
+
+```
+users                    user_profiles
+┌──────────┐            ┌──────────────────┐
+│ id (PK)  │──────────→ │ user_id (PK, FK) │
+│ email    │            │ bio              │
+└──────────┘            │ avatar_url       │
+                        └──────────────────┘
+```
+
+**使いどころ：**
+- 滅多に参照しない大きなデータを別テーブルに分離（プロフィール詳細など）
+- セキュリティ上分離したいデータ（パスワードハッシュなど）
+
+### 1対多（One to Many）
+
+最もよく使う関係。
+
+```
+users                    orders
+┌──────────┐            ┌──────────────────┐
+│ id (PK)  │──────────→ │ id (PK)          │
+│ name     │    1:多    │ user_id (FK)     │
+└──────────┘            │ total_amount     │
+                        └──────────────────┘
+```
+
+→ 1人のユーザーが複数の注文を持つ
+
+### 多対多（Many to Many）
+
+**中間テーブル（Junction Table / Pivot Table）** が必要。
+
+```
+students                  courses
+┌──────────┐             ┌──────────┐
+│ id (PK)  │             │ id (PK)  │
+│ name     │             │ title    │
+└──────────┘             └──────────┘
+      │                        │
+      └───────┬────────────────┘
+              ↓
+      student_courses（中間テーブル）
+      ┌────────────────────────┐
+      │ student_id (FK, PK)    │
+      │ course_id  (FK, PK)    │
+      │ enrolled_at            │  ← 中間テーブル独自の属性も持てる
+      └────────────────────────┘
+```
+
+```sql
+CREATE TABLE student_courses (
+  student_id INT UNSIGNED NOT NULL,
+  course_id  INT UNSIGNED NOT NULL,
+  enrolled_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (student_id, course_id),
+  FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+  FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+);
+```
+
+---
+
+## 4. ER図の書き方（Crow's Foot 記法）
+
+```
+1対1：
+A ──||────||── B
+
+1対多：
+A ──||────<──── B   （||=1、<または>=多）
+
+多対多：
+A ────>────<──── B
+```
+
+実務では draw.io, dbdiagram.io, ER Master などのツールを使うことが多い。
+
+---
+
+## 5. 外部キーを使わない設計について
+
+大規模システムや高トラフィック環境では、外部キー制約を**あえて使わない**選択をすることがある。
+
+**外部キーなしのデメリット：**
+- アプリ側でデータ整合性を保つ責任が生じる
+- 孤立レコード（参照先が存在しないFK）が発生しうる
+
+**外部キーなしを選ぶ理由（実務での判断）：**
+- 大量挿入・更新時のパフォーマンス（FK検証のオーバーヘッド）
+- シャーディング（水平分割）環境では外部キーが機能しない
+- マイクロサービス構成でDBが分かれている場合
+
+**結論：**
+- 中小規模・学習段階では外部キーを積極的に使うべき
+- 大規模・分散構成になったら設計レベルで整合性を担保する方法を検討する
+
+---
+
+## 6. 実践：ECサイトのテーブル関係
+
+```sql
+-- ユーザー
+CREATE TABLE users (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  email      VARCHAR(255) NOT NULL,
+  name       VARCHAR(100) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_email (email)
+);
+
+-- 商品
+CREATE TABLE products (
+  id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name        VARCHAR(200) NOT NULL,
+  price       DECIMAL(10,2) NOT NULL,
+  category_id INT UNSIGNED NOT NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  FOREIGN KEY (category_id) REFERENCES categories(id)
+);
+
+-- 注文
+CREATE TABLE orders (
+  id           INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id      INT UNSIGNED NOT NULL,
+  total_amount DECIMAL(10,2) NOT NULL,
+  ordered_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- 注文明細（ordersとproductsの多対多）
+CREATE TABLE order_items (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   INT UNSIGNED NOT NULL,
+  product_id INT UNSIGNED NOT NULL,
+  qty        INT UNSIGNED NOT NULL,
+  unit_price DECIMAL(10,2) NOT NULL,  -- 注文時点の価格を保存（商品価格が変わっても影響ない）
+  PRIMARY KEY (id),
+  FOREIGN KEY (order_id)   REFERENCES orders(id)   ON DELETE CASCADE,
+  FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT
+);
+```
+
+---
+
+## 7. まとめ
+
+- 主キーは基本 `INT UNSIGNED AUTO_INCREMENT`。公開URLには UUID を検討する
+- 外部キーで参照整合性を保ち、`ON DELETE` の動作を意識して設定する
+- 1対多が最基本。多対多は中間テーブルで解決する
+- 中間テーブルには中間テーブル独自の属性（注文日時、価格スナップショットなど）を持たせることができる
+
+---
+
+**次のステップ：[05_index_design.md](./05_index_design.md)** → 検索を速くするインデックスの設計

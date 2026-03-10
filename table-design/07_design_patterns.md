@@ -1,0 +1,319 @@
+# 07. 設計パターン：実務でよく出るケースと解法
+
+---
+
+## 1. 論理削除（Soft Delete）
+
+### 概要
+
+レコードを物理的にDELETEせず、削除フラグや削除日時で「削除済み」を表現する。
+
+### なぜ必要か
+
+- 削除後も参照する必要がある（注文履歴の商品、退会ユーザーの発言など）
+- 誤削除のリカバリが可能
+- 監査ログとして残したい
+
+### 実装パターン
+
+```sql
+-- パターンA：deleted_at（推奨）
+CREATE TABLE users (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name       VARCHAR(100) NOT NULL,
+  email      VARCHAR(255) NOT NULL,
+  deleted_at DATETIME NULL DEFAULT NULL,  -- NULLなら有効、日時が入れば削除済み
+  PRIMARY KEY (id)
+);
+
+-- 有効なユーザーの取得
+SELECT * FROM users WHERE deleted_at IS NULL;
+
+-- 削除操作
+UPDATE users SET deleted_at = NOW() WHERE id = 100;
+```
+
+```sql
+-- パターンB：is_deleted（シンプルだが削除日時が分からない）
+is_deleted TINYINT(1) NOT NULL DEFAULT 0
+```
+
+### 注意点
+
+```sql
+-- UNIQUE制約との組み合わせ問題
+-- 削除済みユーザーと同じメールアドレスで再登録できない問題が起きる
+
+-- 解決策1：削除時にemailを書き換える
+UPDATE users SET email = CONCAT('deleted_', id, '_', email), deleted_at = NOW()
+WHERE id = 100;
+
+-- 解決策2：UNIQUE制約に deleted_at を含める（MySQLでは難しい）
+-- 解決策3：UNIQUEインデックスをアプリ側のバリデーションで担保する
+
+-- どれもトレードオフがあるため、プロジェクトのポリシーを決めておく
+```
+
+---
+
+## 2. ステータス管理
+
+### TINYINTで管理する方法（推奨）
+
+```sql
+CREATE TABLE orders (
+  id     INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  status TINYINT NOT NULL DEFAULT 0,  -- 0:未払い 1:支払済 2:発送済 3:完了 4:キャンセル
+  PRIMARY KEY (id)
+);
+```
+
+アプリコード側で定数として定義する：
+```php
+// PHP例
+const ORDER_STATUS_UNPAID    = 0;
+const ORDER_STATUS_PAID      = 1;
+const ORDER_STATUS_SHIPPED   = 2;
+const ORDER_STATUS_COMPLETED = 3;
+const ORDER_STATUS_CANCELLED = 4;
+```
+
+### ENUMを使う方法（小規模向け）
+
+```sql
+status ENUM('unpaid', 'paid', 'shipped', 'completed', 'cancelled') NOT NULL DEFAULT 'unpaid'
+```
+
+**ENUMの問題点：**
+- 選択肢の追加・変更がALTER TABLEが必要でロックが発生する
+- 大規模テーブルではENUM変更が重い
+- → 選択肢が増減する可能性があるならTINYINTを推奨
+
+---
+
+## 3. 階層構造（カテゴリの入れ子）
+
+### 隣接リスト（Adjacency List）
+
+最もシンプルな実装。
+
+```sql
+CREATE TABLE categories (
+  id        INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_id INT UNSIGNED NULL,  -- 親なし（ルート）はNULL
+  name      VARCHAR(100) NOT NULL,
+  PRIMARY KEY (id),
+  FOREIGN KEY (parent_id) REFERENCES categories(id)
+);
+
+-- データ例
+-- id=1: 電化製品（parent_id=NULL）
+-- id=2: スマートフォン（parent_id=1）
+-- id=3: Android（parent_id=2）
+```
+
+**デメリット：** 全階層を一度に取得するクエリが複雑（再帰CTEが必要）
+
+```sql
+-- MySQL 8.0以降での再帰取得
+WITH RECURSIVE category_tree AS (
+  SELECT id, name, parent_id, 1 AS depth
+  FROM categories
+  WHERE id = 1  -- ルートから開始
+
+  UNION ALL
+
+  SELECT c.id, c.name, c.parent_id, ct.depth + 1
+  FROM categories c
+  INNER JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT * FROM category_tree;
+```
+
+### 閉包テーブル（Closure Table）
+
+階層の取得・操作が柔軟だが設計が複雑。
+
+```sql
+-- カテゴリ本体
+CREATE TABLE categories (
+  id   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(100) NOT NULL,
+  PRIMARY KEY (id)
+);
+
+-- 全ての祖先-子孫関係を保持する
+CREATE TABLE category_paths (
+  ancestor_id   INT UNSIGNED NOT NULL,
+  descendant_id INT UNSIGNED NOT NULL,
+  depth         INT UNSIGNED NOT NULL,
+  PRIMARY KEY (ancestor_id, descendant_id)
+);
+```
+
+---
+
+## 4. 価格スナップショット
+
+### 問題：価格が変動する
+
+注文した時の商品価格を保存しないと、後から価格が変わったときに金額が変わってしまう。
+
+```sql
+-- ❌ Bad：商品の現在価格を参照するため過去の注文金額が変わる
+CREATE TABLE order_items (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   INT UNSIGNED NOT NULL,
+  product_id INT UNSIGNED NOT NULL,
+  qty        INT UNSIGNED NOT NULL,
+  -- priceはproductsテーブルから参照するだけ → 危険
+  PRIMARY KEY (id)
+);
+
+-- ✅ Good：注文時点の価格をスナップショットとして保存する
+CREATE TABLE order_items (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   INT UNSIGNED NOT NULL,
+  product_id INT UNSIGNED NOT NULL,
+  qty        INT UNSIGNED NOT NULL,
+  unit_price DECIMAL(10,2) NOT NULL,  -- 注文時の価格（スナップショット）
+  PRIMARY KEY (id)
+);
+```
+
+### スナップショットが必要なケース
+
+- 注文明細の単価
+- 購入時のポイントレート・割引率
+- 送料計算時の重量
+- 税率（消費税率変更への対応）
+
+---
+
+## 5. 権限・ロール管理
+
+### シンプルなケース：roleカラム
+
+```sql
+-- usersテーブルにroleカラムを追加（役割が少ない場合）
+role TINYINT NOT NULL DEFAULT 0  -- 0:一般ユーザー 1:管理者 2:スーパーAdmin
+```
+
+### 複雑なケース：RBAC（Role-Based Access Control）
+
+```sql
+-- ロール定義
+CREATE TABLE roles (
+  id   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL,
+  PRIMARY KEY (id)
+);
+
+-- ユーザーとロールの紐付け（多対多）
+CREATE TABLE user_roles (
+  user_id    INT UNSIGNED NOT NULL,
+  role_id    INT UNSIGNED NOT NULL,
+  granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, role_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
+);
+
+-- パーミッション定義
+CREATE TABLE permissions (
+  id   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(100) NOT NULL,  -- 例: 'articles.create', 'users.delete'
+  PRIMARY KEY (id)
+);
+
+-- ロールとパーミッションの紐付け
+CREATE TABLE role_permissions (
+  role_id       INT UNSIGNED NOT NULL,
+  permission_id INT UNSIGNED NOT NULL,
+  PRIMARY KEY (role_id, permission_id)
+);
+```
+
+---
+
+## 6. 汎用タグシステム
+
+```sql
+-- タグの定義
+CREATE TABLE tags (
+  id   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_name (name)
+);
+
+-- 記事とタグの関係（多対多）
+CREATE TABLE article_tags (
+  article_id INT UNSIGNED NOT NULL,
+  tag_id     INT UNSIGNED NOT NULL,
+  PRIMARY KEY (article_id, tag_id),
+  FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE,
+  FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+);
+```
+
+---
+
+## 7. 通知システム
+
+```sql
+CREATE TABLE notifications (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id    INT UNSIGNED NOT NULL,
+  type       VARCHAR(50) NOT NULL,    -- 'follow', 'like', 'comment' など
+  title      VARCHAR(200) NOT NULL,
+  body       TEXT NULL,
+  data       JSON NULL,               -- 通知に紐づく追加データ（柔軟に使える）
+  is_read    TINYINT(1) NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  read_at    DATETIME NULL,
+  PRIMARY KEY (id),
+  INDEX idx_user_read (user_id, is_read),   -- 未読通知取得用
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+```
+
+---
+
+## 8. 変更履歴・監査ログ
+
+### イベントソーシングパターン
+
+```sql
+-- 注文のステータス変更を履歴として記録
+CREATE TABLE order_status_histories (
+  id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id   INT UNSIGNED NOT NULL,
+  from_status TINYINT NOT NULL,
+  to_status   TINYINT NOT NULL,
+  reason     VARCHAR(500) NULL,
+  changed_by INT UNSIGNED NULL,      -- 変更した人（ユーザーIDまたは管理者ID）
+  changed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  INDEX idx_order_id (order_id),
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+);
+```
+
+---
+
+## 9. まとめ
+
+| パターン | 使いどころ |
+|---------|-----------|
+| 論理削除 | 削除後も参照が必要なデータ |
+| ステータス管理 | 状態を持つエンティティ（注文、申請など） |
+| 階層構造 | カテゴリ、コメントツリーなど |
+| 価格スナップショット | 注文明細、請求書など「その時点の値」が重要なもの |
+| 権限・ロール | ユーザーの権限管理 |
+| タグシステム | 多対多でラベルをつける場面 |
+| 変更履歴 | 監査・トレーサビリティが必要な場面 |
+
+---
+
+**次のステップ：[08_performance.md](./08_performance.md)** → 遅いクエリを生まない設計の考え方
