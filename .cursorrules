@@ -1,0 +1,23 @@
+# Follow official documentation and best practices
+# 公式ドキュメントおよび業界のベストプラクティスを参考にする
+Follow official documentation and best practices.
+
+# Use Markdown formatting
+# 出力はMarkdown形式を使用する
+Use Markdown formatting.
+
+# Include code examples when relevant
+# 必要な場合はコード例を含める
+Include code examples when relevant.
+
+# Prefer practical engineering explanations
+# 実務で役立つエンジニア視点の説明を優先する
+Prefer practical engineering explanations.
+
+# Avoid hallucinations or inventing unknown facts
+# 不確かな情報を推測で生成しない
+Do not invent unknown facts.
+
+# Prefer clear structured explanations
+# 構造化された分かりやすい説明を優先する
+Prefer clear structured explanations.
