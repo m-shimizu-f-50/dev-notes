@@ -32,3 +32,29 @@ docs
 │
 └─ infrastructure
     └─ scalability.md
+
+
+
+## 質問フォーマット（テーマと要望を指定）
+
+以下の形式でCursorに依頼してください。
+
+prompts/doc-generator.md のプロンプトを使用して  
+docs 配下に新しいフォルダを作成し、技術ドキュメントを生成してください。
+
+作成するファイル:
+docs/<folder-name>/<file-name>.md
+
+テーマ:
+<作成したいテーマ>
+
+例:
+
+prompts/doc-generator.md のプロンプトを使用して  
+docs/tools フォルダを作成し、以下のドキュメントを作成してください。
+
+作成ファイル:
+docs/tools/superwhisper.md
+
+テーマ:
+Superwhisperの使い方
