@@ -54,7 +54,7 @@ prompts/doc-generator.md のプロンプトを使用して
 docs/tools フォルダを作成し、以下のドキュメントを作成してください。
 
 作成ファイル:
-docs/tools/superwhisper.md
+docs/その他/SuperWhisperの使い方.md
 
 テーマ:
 Superwhisperの使い方
